@@ -34,5 +34,5 @@ def api_scrape(req: ScrapeRequest):
             item = scrape_iscreammall(url)
             results.append({"url": url, "ok": True, "data": item})
         except Exception as e:
-            results.append({"url": url, "ok": False, "error": str(e)})
+            results.append({"url": url, "ok": False, "error": f"{type(e).__name__}: {e}"})
     return {"count": len(results), "results": results}
