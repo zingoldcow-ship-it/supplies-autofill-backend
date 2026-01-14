@@ -1,104 +1,174 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Dict, Any, Tuple
 import re
+
+import pandas as pd
 from openpyxl import load_workbook
+
 
 @dataclass
 class CartItem:
-    name_raw: str
+    name: str
+    spec: str
     qty: int
-    unit_price_list: int   # 정가(1개당 금액)
-    unit_price_sale: int   # 할인적용금액(할인 후 단가)
-    product_code: str = "" # 장바구니 엑셀에는 보통 없음(비워둠)
+    unit_price_list: int   # 단가(정가)
+    unit_price_sale: int   # 단가(할인)
+    product_code: str = ""
 
-def _to_int_price(val) -> int:
+
+_NUM_RE = re.compile(r"[^\d\-]+")
+
+
+def _to_int(val: Any) -> int:
+    """Convert Excel cell values like '12,300원' or 12300.0 to int. None -> 0."""
     if val is None:
         return 0
-    if isinstance(val, (int, float)):
+    if isinstance(val, (int,)):
         return int(val)
+    if isinstance(val, float):
+        # Excel often stores integer-looking numbers as floats
+        return int(round(val))
     s = str(val).strip()
-    s = s.replace(",", "").replace("원", "").strip()
-    m = re.search(r"(\d+)", s)
-    return int(m.group(1)) if m else 0
-
-def _to_int_qty(val) -> int:
-    if val is None:
+    if not s:
         return 0
-    if isinstance(val, (int, float)):
-        return int(val)
-    s = str(val).strip().replace(",", "")
-    return int(s) if s.isdigit() else 0
+    # keep minus if any, drop everything else
+    s = _NUM_RE.sub("", s)
+    if s in ("", "-", "--"):
+        return 0
+    try:
+        return int(s)
+    except ValueError:
+        return 0
 
-def _split_name_and_spec(name: str) -> tuple[str, str]:
+
+def _to_qty(val: Any) -> int:
+    q = _to_int(val)
+    return max(q, 0)
+
+
+def split_name_and_spec(name_raw: str) -> Tuple[str, str]:
     """
-    규격이 상품명 안에 같이 적힌 경우가 많아서,
-    괄호/대괄호 뒤쪽을 '규격'으로 분리해보되,
-    실패하면 규격은 빈칸으로 둡니다.
+    Try to split '상품명(규격)' / '상품명 [규격]' / '상품명 / 규격' patterns.
+    If unsure, return (상품명, '').
     """
-    if not name:
+    name_raw = (name_raw or "").strip()
+    if not name_raw:
         return "", ""
-    # 예: "에어 더블클립 (19mm)" -> ("에어 더블클립", "19mm")
-    m = re.match(r"^(.*?)\s*[\(\[]\s*(.+?)\s*[\)\]]\s*$", name)
-    if m:
-        return m.group(1).strip(), m.group(2).strip()
-    return name.strip(), ""
 
-def parse_iscreammall_cart_xlsx(path: str) -> List[CartItem]:
+    # 1) trailing parentheses
+    m = re.match(r"^(.*?)[\s]*\(([^()]*)\)[\s]*$", name_raw)
+    if m and m.group(2).strip():
+        return m.group(1).strip(), m.group(2).strip()
+
+    # 2) trailing brackets
+    m = re.match(r"^(.*?)[\s]*\[(.*?)\][\s]*$", name_raw)
+    if m and m.group(2).strip():
+        return m.group(1).strip(), m.group(2).strip()
+
+    # 3) slash-separated (use last part as spec if it looks short-ish)
+    if " / " in name_raw:
+        parts = [p.strip() for p in name_raw.split(" / ") if p.strip()]
+        if len(parts) >= 2:
+            # heuristic: treat last segment as spec if it's not too long
+            spec = parts[-1]
+            base = " / ".join(parts[:-1]).strip()
+            if base and spec and len(spec) <= 40:
+                return base, spec
+
+    return name_raw, ""
+
+
+def _normalize_header(h: Any) -> str:
+    if h is None:
+        return ""
+    s = str(h).strip().lower()
+    s = re.sub(r"\s+", "", s)
+    return s
+
+
+def _detect_header_row(ws, max_scan_rows: int = 60) -> int:
+    """Find header row by looking for 대표 키워드(상품명/수량 등)."""
+    keywords = {"상품명", "품명", "수량", "정가", "할인가", "판매가", "할인적용금액"}
+    for r in range(1, min(ws.max_row, max_scan_rows) + 1):
+        vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+        text = [str(v).strip() for v in vals if isinstance(v, str)]
+        hit = sum(1 for t in text if t.strip() in keywords)
+        # also accept if "상품명" substring exists in row
+        if hit >= 2 or any(isinstance(v, str) and ("상품명" in v or "품명" in v) for v in vals):
+            return r
+    return 1
+
+
+def parse_iscreammall_cart_xlsx(file_like_or_path) -> List[CartItem]:
     """
-    아이스크림몰 '견적서/장바구니' 엑셀을 읽어 상품 목록을 추출합니다.
-    기대 헤더(예시): 순번, 상품명, 1개당 금액, 할인적용금액, 수량
+    Parse IcecreamMall cart/estimate xlsx into a list of CartItem.
+
+    The cart format can vary, so this function:
+    - detects the header row,
+    - maps columns by fuzzy header matching,
+    - derives missing unit prices from totals if possible.
     """
-    wb = load_workbook(path, data_only=True)
+    wb = load_workbook(file_like_or_path, data_only=True)
     ws = wb.active
 
-    header_row = None
-    col_map = {}
-    for r in range(1, min(ws.max_row, 100) + 1):
-        row_vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
-        if any(isinstance(v, str) and v.strip() == "순번" for v in row_vals):
-            header_row = r
-            # map headers -> col index
-            for c, v in enumerate(row_vals, start=1):
-                if isinstance(v, str):
-                    key = v.strip()
-                    col_map[key] = c
-            break
+    header_row = _detect_header_row(ws)
+    headers = [ws.cell(header_row, c).value for c in range(1, ws.max_column + 1)]
+    norm_headers = [_normalize_header(h) for h in headers]
 
-    if header_row is None:
-        raise ValueError("상품정보 헤더(순번)가 있는 행을 찾지 못했습니다. 원본 장바구니/견적서 엑셀인지 확인해주세요.")
+    def find_col(candidates):
+        for cand in candidates:
+            cand_n = _normalize_header(cand)
+            for idx, h in enumerate(norm_headers, start=1):
+                if not h:
+                    continue
+                if cand_n == h:
+                    return idx
+            # substring match
+            for idx, h in enumerate(norm_headers, start=1):
+                if cand_n and h and cand_n in h:
+                    return idx
+        return None
 
-    def col(name: str) -> int:
-        if name not in col_map:
-            raise ValueError(f"필수 열 '{name}'을(를) 찾지 못했습니다. 현재 헤더: {list(col_map.keys())}")
-        return col_map[name]
+    col_name = find_col(["상품명", "품명", "상품명/옵션", "상품정보", "제품명"])
+    col_qty = find_col(["수량", "주문수량", "구매수량", "수량(개)"])
+    col_list = find_col(["정가", "정상가", "소비자가", "판매가(정가)", "기준가"])
+    col_sale = find_col(["할인가", "판매가", "할인적용금액", "구매가", "공급가"])
+    col_total = find_col(["금액", "합계", "총금액", "판매금액", "결제금액"])
+    col_code = find_col(["상품코드", "상품번호", "코드"])
 
-    c_name = col("상품명")
-    c_list = col("1개당 금액")
-    c_sale = col("할인적용금액")
-    c_qty  = col("수량")
-
+    # Read rows under header into dicts
     items: List[CartItem] = []
-    # 데이터는 헤더 다음 행부터
     for r in range(header_row + 1, ws.max_row + 1):
-        name_val = ws.cell(r, c_name).value
-        qty_val  = ws.cell(r, c_qty).value
-        list_val = ws.cell(r, c_list).value
-        sale_val = ws.cell(r, c_sale).value
-
-        # 빈 줄 스킵
-        if name_val is None and qty_val is None and list_val is None and sale_val is None:
+        name_val = ws.cell(r, col_name).value if col_name else None
+        if name_val is None or str(name_val).strip() == "":
             continue
 
-        name = str(name_val).strip() if name_val else ""
-        qty = _to_int_qty(qty_val)
-        if not name or qty <= 0:
-            continue
+        qty = _to_qty(ws.cell(r, col_qty).value) if col_qty else 0
+        if qty <= 0:
+            # some exports use 1 by default if missing
+            qty = 1
 
-        unit_list = _to_int_price(list_val)
-        unit_sale = _to_int_price(sale_val)
-        items.append(CartItem(name_raw=name, qty=qty, unit_price_list=unit_list, unit_price_sale=unit_sale))
+        unit_list = _to_int(ws.cell(r, col_list).value) if col_list else 0
+        unit_sale = _to_int(ws.cell(r, col_sale).value) if col_sale else 0
+        total = _to_int(ws.cell(r, col_total).value) if col_total else 0
+
+        # derive missing unit prices
+        if unit_sale == 0 and total > 0 and qty > 0:
+            unit_sale = int(round(total / qty))
+        if unit_list == 0 and unit_sale > 0:
+            unit_list = unit_sale
+
+        code = ""
+        if col_code:
+            code_val = ws.cell(r, col_code).value
+            code = str(code_val).strip() if code_val is not None else ""
+
+        name, spec = split_name_and_spec(str(name_val))
+        items.append(CartItem(name=name, spec=spec, qty=qty, unit_price_list=unit_list, unit_price_sale=unit_sale, product_code=code))
 
     if not items:
-        raise ValueError("추출된 상품이 없습니다. 장바구니에 상품이 담긴 엑셀인지 확인해주세요.")
+        raise ValueError("추출된 상품이 없습니다. 아이스크림몰 장바구니/견적서 엑셀인지 확인해 주세요.")
+
     return items
