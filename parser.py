@@ -1,147 +1,160 @@
 from __future__ import annotations
-
+import io
 import re
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-
 import pandas as pd
+import numpy as np
 
+RE_NUM = re.compile(r"[^0-9\-]+")
 
-@dataclass
-class ParsedItem:
-    name: str
-    spec: str
-    qty: float
-    unit_list: float
-    unit_sale: float
-    product_code: str
-    site: str = "아이스크림몰"
-
-
-def _to_number(x) -> float:
-    """Convert '28,400원' / '1,234' / 1234 / None -> float."""
-    if x is None:
-        return 0.0
-    if isinstance(x, (int, float)):
-        return float(x)
+def _to_int(x):
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return None
+    if isinstance(x, (int, np.integer)):
+        return int(x)
     s = str(x).strip()
-    if s == "":
-        return 0.0
-    # keep digits, dot, minus
-    s = re.sub(r"[^\d\.\-]", "", s)
-    if s in ("", "-", ".", "-."):
-        return 0.0
+    if s == "" or s.lower() == "none":
+        return None
+    s = RE_NUM.sub("", s)
+    if s in ("", "-"):
+        return None
     try:
-        return float(s)
-    except ValueError:
-        return 0.0
-
-
-def split_name_spec(raw_name: str) -> Tuple[str, str]:
-    """Try to split spec from name using (), [], or ' / ' patterns."""
-    if not raw_name:
-        return "", ""
-    name = str(raw_name).strip()
-    # parentheses
-    m = re.search(r"^(.*?)[\s]*\(([^)]{1,80})\)[\s]*$", name)
-    if m:
-        return m.group(1).strip(), m.group(2).strip()
-    # brackets
-    m = re.search(r"^(.*?)[\s]*\[([^\]]{1,80})\][\s]*$", name)
-    if m:
-        return m.group(1).strip(), m.group(2).strip()
-    # slash with spaces
-    if " / " in name:
-        left, right = name.split(" / ", 1)
-        # treat right side as spec if it's short-ish
-        if len(right.strip()) <= 30:
-            return left.strip(), right.strip()
-    return name, ""
-
-
-def detect_header_row(df: pd.DataFrame) -> int:
-    """Find a likely header row index by scanning for '상품명' and '수량'."""
-    for i in range(min(30, len(df))):
-        row = df.iloc[i].astype(str).fillna("")
-        row_join = " ".join(row.tolist())
-        if ("상품명" in row_join) and ("수량" in row_join):
-            return i
-    return 0
-
-
-def normalize_columns(cols: List[str]) -> List[str]:
-    out = []
-    for c in cols:
-        s = str(c).strip()
-        s = re.sub(r"\s+", " ", s)
-        out.append(s)
-    return out
-
-
-def parse_icecream_excel(upload_bytes: bytes) -> pd.DataFrame:
-    """
-    Parse an IcecreamMall cart/estimate Excel into a normalized dataframe with columns:
-    품목, 규격, 수량, 단가(정가), 단가(할인), 금액(정가), 최종금액, 상품코드, 사이트
-    """
-    # read first sheet raw (no header)
-    raw = pd.read_excel(upload_bytes, header=None, engine="openpyxl")
-    header_i = detect_header_row(raw)
-    df = pd.read_excel(upload_bytes, header=header_i, engine="openpyxl")
-    df.columns = normalize_columns(list(df.columns))
-
-    # candidate columns
-    def pick(*cands):
-        for c in cands:
-            if c in df.columns:
-                return c
-        # fuzzy contains
-        for col in df.columns:
-            for c in cands:
-                if c and (c in str(col)):
-                    return col
+        return int(float(s))
+    except Exception:
         return None
 
-    col_name = pick("상품명", "품명", "상품")
-    col_qty = pick("수량", "구매수량", "주문수량")
-    col_unit_list = pick("1개당 금액", "정가", "판매가", "상품가격", "단가")
-    col_unit_sale = pick("할인적용금액", "할인가", "할인금액", "할인적용")
-    col_code = pick("상품코드", "상품 코드", "코드", "상품번호")
+def _find_header_row(raw: pd.DataFrame, max_scan: int = 30) -> int:
+    # Find a row that likely contains header names.
+    for r in range(min(max_scan, len(raw))):
+        row = raw.iloc[r].astype(str).fillna("").str.replace("\n", " ").str.strip()
+        joined = " | ".join(row.tolist())
+        if ("상품" in joined and "수량" in joined) or ("상품명" in joined):
+            return r
+    return 0
 
-    # If sale unit missing, fall back to list unit.
-    if col_unit_sale is None:
-        col_unit_sale = col_unit_list
+def _pick_col(cols, keywords):
+    for k in keywords:
+        for c in cols:
+            if k in c:
+                return c
+    return None
 
-    # build rows
-    items = []
-    for _, r in df.iterrows():
-        nm = "" if col_name is None else r.get(col_name)
-        if pd.isna(nm) or str(nm).strip() == "":
+def _extract_code_from_text(name: str):
+    # Extract product code from patterns like [11033697] or (11033697) or trailing digits
+    if not name:
+        return None, name
+    code = None
+    m = re.search(r"\[(\d{6,})\]", name)
+    if m:
+        code = m.group(1)
+        name = re.sub(r"\s*\[\d{6,}\]\s*", " ", name).strip()
+        return code, name
+    m = re.search(r"\((\d{6,})\)", name)
+    if m:
+        code = m.group(1)
+        name = re.sub(r"\s*\(\d{6,}\)\s*", " ", name).strip()
+        return code, name
+    m = re.search(r"(\d{6,})\s*$", name)
+    if m:
+        code = m.group(1)
+        # don't remove if the whole name is just digits
+        if len(name) > len(code) + 1:
+            name = re.sub(r"\s*\d{6,}\s*$", "", name).strip()
+    return code, name
+
+def _extract_spec_from_option_line(text: str):
+    # Examples: "사이즈별 : 25mm" / "옵션: 3호" / "색상: 빨강"
+    if not text:
+        return None
+    t = str(text).strip()
+    m = re.match(r"^\s*([^\:]{1,12})\s*[:：]\s*(.+?)\s*$", t)
+    if not m:
+        return None
+    key = m.group(1).strip()
+    val = m.group(2).strip()
+    # Keep only the value as "규격" (teacher wanted spec found from the row)
+    if val:
+        return val
+    return None
+
+def parse_icecream_excel(xlsx_bytes: bytes) -> pd.DataFrame:
+    # Read without header to detect header row
+    raw = pd.read_excel(io.BytesIO(xlsx_bytes), header=None)
+    header_row = _find_header_row(raw)
+    df = pd.read_excel(io.BytesIO(xlsx_bytes), header=header_row)
+    df.columns = [str(c).strip().replace("\n", " ") for c in df.columns]
+
+    cols = list(df.columns)
+
+    col_name = _pick_col(cols, ["상품명", "상품"])
+    col_qty = _pick_col(cols, ["수량", "개수"])
+    col_unit_regular = _pick_col(cols, ["정가", "판매가", "상품가격", "단가(정가)", "단가"])
+    col_unit_discount = _pick_col(cols, ["할인가", "할인적용", "구매가", "단가(할인)"])
+    col_total_discount = _pick_col(cols, ["최종금액", "결제금액", "합계", "금액(할인)", "할인금액"])
+    col_code = _pick_col(cols, ["상품코드", "상품번호", "상품ID", "상품코드(옵션)"])
+
+    if col_name is None:
+        raise ValueError("상품명 컬럼을 찾지 못했습니다. (엑셀 헤더가 예상과 다릅니다)")
+
+    # Build normalized rows
+    out_rows = []
+    last_idx = None
+
+    for _, row in df.iterrows():
+        name = row.get(col_name)
+        name = "" if (name is None or (isinstance(name, float) and np.isnan(name))) else str(name).strip()
+        if name == "":
             continue
 
-        qty = _to_number(r.get(col_qty)) if col_qty else 0.0
-        unit_list = _to_number(r.get(col_unit_list)) if col_unit_list else 0.0
-        unit_sale = _to_number(r.get(col_unit_sale)) if col_unit_sale else unit_list
-        code = "" if col_code is None else ("" if pd.isna(r.get(col_code)) else str(r.get(col_code)).strip())
+        qty = _to_int(row.get(col_qty)) if col_qty else None
+        unit_r = _to_int(row.get(col_unit_regular)) if col_unit_regular else None
+        unit_d = _to_int(row.get(col_unit_discount)) if col_unit_discount else None
+        tot_d = _to_int(row.get(col_total_discount)) if col_total_discount else None
+        code = row.get(col_code) if col_code else None
+        code = None if (code is None or (isinstance(code, float) and np.isnan(code))) else str(code).strip()
+        if code and not re.fullmatch(r"\d{4,}", code):
+            # keep only digits if mixed
+            digits = re.sub(r"\D", "", code)
+            code = digits if digits else None
 
-        name, spec = split_name_spec(str(nm))
-        items.append(
-            {
-                "품목": name,
-                "규격": spec,
-                "수량": qty,
-                "단가(정가)": unit_list,
-                "단가(할인)": unit_sale,
-                "금액(정가)": qty * unit_list,
-                "최종금액": qty * unit_sale,
-                "상품코드": code,
-                "사이트": "아이스크림몰",
-            }
-        )
+        # Option/spec line handling: when qty and prices are missing, treat as spec for previous item
+        if (qty is None) and (unit_r is None) and (unit_d is None) and (tot_d is None):
+            spec = _extract_spec_from_option_line(name)
+            if spec and last_idx is not None:
+                out_rows[last_idx]["규격"] = spec
+            continue
 
-    out = pd.DataFrame(items)
-    # basic type cleanup
-    if not out.empty:
-        out["수량"] = out["수량"].astype(float)
-        for c in ["단가(정가)", "단가(할인)", "금액(정가)", "최종금액"]:
-            out[c] = out[c].astype(float)
-    return out
+        # Regular product line
+        # Extract code embedded in name if code column absent
+        embedded_code, cleaned_name = _extract_code_from_text(name)
+        if not code and embedded_code:
+            code = embedded_code
+        name = cleaned_name
+
+        # If unit_d missing but tot_d and qty exist -> compute
+        if unit_d is None and tot_d is not None and qty:
+            unit_d = int(round(tot_d / qty))
+        if unit_r is None:
+            unit_r = unit_d
+
+        # If tot_d missing -> compute
+        if tot_d is None and qty and unit_d is not None:
+            tot_d = qty * unit_d
+
+        out = {
+            "품목": name,
+            "규격": None,                # may be filled by option line below
+            "수량": qty,
+            "단가(정가)": unit_r,
+            "단가(할인)": unit_d,
+            "금액(정가)": (qty * unit_r) if (qty and unit_r is not None) else None,
+            "최종금액": tot_d,
+            "상품코드": code,
+            "사이트": "아이스크림몰",
+        }
+        out_rows.append(out)
+        last_idx = len(out_rows) - 1
+
+    out_df = pd.DataFrame(out_rows, columns=["품목","규격","수량","단가(정가)","단가(할인)","금액(정가)","최종금액","상품코드","사이트"])
+    # Clean NaNs to None for nicer display
+    out_df = out_df.where(pd.notnull(out_df), None)
+    return out_df
