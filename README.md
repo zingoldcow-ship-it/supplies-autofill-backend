@@ -1,11 +1,13 @@
-# 아이스크림몰 장바구니 엑셀 → 학습준비물 신청서 자동 변환 (Streamlit)
+# 아이스크림몰 장바구니 → 양식 자동 채움 (Streamlit)
 
-## 실행(로컬)
+## 실행
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Streamlit Community Cloud 배포
-- GitHub에 이 폴더를 그대로 올립니다.
-- Streamlit Cloud에서 repo 선택 후, entrypoint를 `app.py`로 지정합니다.
+## 기능
+- 아이스크림몰 장바구니/견적서 엑셀 업로드
+- 품목/규격/수량/정가/할인가 추출
+- 제공된 `template.xlsx` 양식에 자동 작성
+- 웹에서 미리보기 + 결과 엑셀 다운로드
