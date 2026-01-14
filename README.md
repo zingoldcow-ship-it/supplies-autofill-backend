@@ -1,24 +1,11 @@
-# School Supplies Auto-Fill API (Backend)
+# 아이스크림몰 장바구니 엑셀 → 학습준비물 신청서 자동 변환 (Streamlit)
 
-## What it does
-POST a list of i-screammall product URLs and get back:
-- name (품명)
-- unit_price (단가)
-- product_code (상품코드)
-- site (아이스크림몰)
-
-## Local run
+## 실행(로컬)
 ```bash
 pip install -r requirements.txt
-uvicorn app.main:app --reload
-```
-Test:
-```bash
-curl -X POST http://127.0.0.1:8000/api/scrape -H "Content-Type: application/json" -d '{"urls":["https://i-screammall.co.kr/goods/detail/10970545"]}'
+streamlit run app.py
 ```
 
-## Deploy on Render (Docker)
-- Create a new **Web Service**
-- Select **Docker**
-- Connect this repo
-- Deploy
+## Streamlit Community Cloud 배포
+- GitHub에 이 폴더를 그대로 올립니다.
+- Streamlit Cloud에서 repo 선택 후, entrypoint를 `app.py`로 지정합니다.
