@@ -1,18 +1,15 @@
-FROM python:3.11-slim
+FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
 
 WORKDIR /app
-
-# System deps (keep minimal)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Ensure browsers are present (base image already includes)
+# RUN playwright install --with-deps chromium
+
 COPY app ./app
 
-# Render provides PORT env var
 ENV PORT=8000
 EXPOSE 8000
 
